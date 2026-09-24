@@ -65,16 +65,17 @@ type Config struct {
 	ReviewVotesPerDay int64
 
 	// 履约与纠纷时限
-	GraceReportH    int64  // 举报后宽限
-	AutoConfirmH    int64  // 待确认到账多少小时不处理视为已收到（自动完成）
-	AutoDisputeDays int64  // 自动完成后多少天内接单方仍可发起 B 类申诉
-	TGBotToken      string // Telegram 机器人令牌（空 = 不启用推送）
-	TGAPIBase       string // Telegram Bot API 根（测试用桩）
-	EvidenceWindowH int64
-	RecheckUnknownH int64 // 复检无结论多久后判通过
-	VoidStrikes     int64 // 30 天内留存不达标几次暂停接单
-	VoidSuspendDays int64
-	ConfirmRemindH  []int64
+	GraceReportH        int64  // 举报后宽限
+	OverdueAutoDefaultH int64  // 逾期多少小时仍未付：不等举报，自动记为违约并上黑名单（0 = 关闭）；至少提前 24 小时警告
+	AutoConfirmH        int64  // 待确认到账多少小时不处理视为已收到（自动完成）
+	AutoDisputeDays     int64  // 自动完成后多少天内接单方仍可发起 B 类申诉
+	TGBotToken          string // Telegram 机器人令牌（空 = 不启用推送）
+	TGAPIBase           string // Telegram Bot API 根（测试用桩）
+	EvidenceWindowH     int64
+	RecheckUnknownH     int64 // 复检无结论多久后判通过
+	VoidStrikes         int64 // 30 天内留存不达标几次暂停接单
+	VoidSuspendDays     int64
+	ConfirmRemindH      []int64
 
 	// 信用额度（单位 U，内部 e8）
 	ExposureNewbieE8  int64
@@ -246,6 +247,10 @@ func loadConfig(path string) (*Config, error) {
 	c.MaxVariants = getInt("MAX_VARIANTS", 5)
 	c.VerifyAttempts = getInt("VERIFY_ATTEMPTS", 3)
 	c.GraceReportH = getInt("GRACE_REPORT_H", 24)
+	c.OverdueAutoDefaultH = getInt("OVERDUE_AUTO_DEFAULT_H", 72)
+	if c.OverdueAutoDefaultH > 0 && c.OverdueAutoDefaultH < 24 {
+		c.OverdueAutoDefaultH = 24 // 至少给 24 小时警告期，文案与实际才一致
+	}
 	c.AutoConfirmH = getInt("AUTO_CONFIRM_H", 24)
 	c.AutoDisputeDays = getInt("AUTO_DISPUTE_DAYS", 7)
 	c.TGBotToken = get("TG_BOT_TOKEN", "")

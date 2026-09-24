@@ -178,8 +178,8 @@ func (a *App) buildSubPage(w http.ResponseWriter, r *http.Request, x *Submission
 	p.CanPay = strict && payState && p.Payee.Gateway() && a.gwc != nil
 	noOpenD := p.Dispute == nil || p.Dispute.Type != "D"
 	p.CanMark = strict && noOpenD && (x.Status == SPayable || x.Status == SOverdue || disputedOverdue || (p.TopupE8 > 0 && x.TopupMarkedAt == 0))
-	p.CanConfirm = p.IsWorker && x.Status == SAwait
-	p.CanPayNow = strict && x.Status == SVerified && p.Dispute == nil && !t.CPM() // 按浏览量计价的要等留存期末的浏览量，提前结算会按接近保底付
+	p.CanConfirm = p.IsWorker && (x.Status == SAwait || x.Status == SPayable || x.Status == SOverdue) // 发布方付了没登记，接单方也能直接完成
+	p.CanPayNow = strict && x.Status == SVerified && p.Dispute == nil && !t.CPM()                     // 按浏览量计价的要等留存期末的浏览量，提前结算会按接近保底付
 	if x.Status == SAwait && a.cfg.AutoConfirmH > 0 && !(x.TopupMarkedAt == 0 && x.TopupRequested > 0) {
 		p.AutoAt = max(x.MarkedPaidAt, x.TopupMarkedAt) + a.cfg.AutoConfirmH*hourMs
 	}
@@ -515,7 +515,7 @@ func (a *App) handleConfirm(w http.ResponseWriter, r *http.Request) {
 		a.errorPage(w, r, http.StatusForbidden, "没有权限", "")
 		return
 	}
-	if x.Status != SAwait {
+	if x.Status != SAwait && x.Status != SPayable && x.Status != SOverdue {
 		a.flash(w, "当前状态不能确认")
 		http.Redirect(w, r, x.Path(), http.StatusFound)
 		return

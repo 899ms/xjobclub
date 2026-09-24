@@ -6,12 +6,12 @@ import (
 	"strings"
 )
 
-const subCols = `id,code,task_id,worker_id,variant_idx,status,prev_status,claimed_at,claim_expires_at,tweet_id,tweet_url,tweet_root,tweet_text,tweet_created_at,verify_attempts,verify_retries,last_error,next_verify_at,verified_at,recheck_due_at,recheck_flag,recheck_tries,payable_at,pay_deadline_at,overdue_at,reported_at,grace_until,marked_paid_at,marked_order_id,marked_note,underpaid_e8,topup_requested_at,topup_marked_at,topup_order_id,confirmed_at,confirm_method,paid_amount_e8,late,void_reason,defaulted_at,self_deal,unreadable,created_at,updated_at,checking_at,check_note,check_rejects,check_auto,amount_e8,views,views_at,settle_views`
+const subCols = `id,code,task_id,worker_id,variant_idx,status,prev_status,claimed_at,claim_expires_at,tweet_id,tweet_url,tweet_root,tweet_text,tweet_created_at,verify_attempts,verify_retries,last_error,next_verify_at,verified_at,recheck_due_at,recheck_flag,recheck_tries,payable_at,pay_deadline_at,overdue_at,reported_at,grace_until,marked_paid_at,marked_order_id,marked_note,underpaid_e8,topup_requested_at,topup_marked_at,topup_order_id,confirmed_at,confirm_method,paid_amount_e8,late,void_reason,defaulted_at,self_deal,unreadable,created_at,updated_at,checking_at,check_note,check_rejects,check_auto,amount_e8,views,views_at,settle_views,default_warned_at`
 
 func scanSub(r scanner) (*Submission, error) {
 	var x Submission
 	var late int64
-	err := r.Scan(&x.ID, &x.Code, &x.TaskID, &x.WorkerID, &x.VariantIdx, &x.Status, &x.PrevStatus, &x.ClaimedAt, &x.ClaimExpiresAt, &x.TweetID, &x.TweetURL, &x.TweetRoot, &x.TweetText, &x.TweetCreatedAt, &x.VerifyAttempts, &x.VerifyRetries, &x.LastError, &x.NextVerifyAt, &x.VerifiedAt, &x.RecheckDueAt, &x.RecheckFlag, &x.RecheckTries, &x.PayableAt, &x.PayDeadlineAt, &x.OverdueAt, &x.ReportedAt, &x.GraceUntil, &x.MarkedPaidAt, &x.MarkedOrderID, &x.MarkedNote, &x.UnderpaidE8, &x.TopupRequested, &x.TopupMarkedAt, &x.TopupOrderID, &x.ConfirmedAt, &x.ConfirmMethod, &x.PaidAmountE8, &late, &x.VoidReason, &x.DefaultedAt, &x.SelfDeal, &x.Unreadable, &x.CreatedAt, &x.UpdatedAt, &x.CheckingAt, &x.CheckNote, &x.CheckRejects, &x.CheckAuto, &x.AmountE8, &x.Views, &x.ViewsAt, &x.SettleViews)
+	err := r.Scan(&x.ID, &x.Code, &x.TaskID, &x.WorkerID, &x.VariantIdx, &x.Status, &x.PrevStatus, &x.ClaimedAt, &x.ClaimExpiresAt, &x.TweetID, &x.TweetURL, &x.TweetRoot, &x.TweetText, &x.TweetCreatedAt, &x.VerifyAttempts, &x.VerifyRetries, &x.LastError, &x.NextVerifyAt, &x.VerifiedAt, &x.RecheckDueAt, &x.RecheckFlag, &x.RecheckTries, &x.PayableAt, &x.PayDeadlineAt, &x.OverdueAt, &x.ReportedAt, &x.GraceUntil, &x.MarkedPaidAt, &x.MarkedOrderID, &x.MarkedNote, &x.UnderpaidE8, &x.TopupRequested, &x.TopupMarkedAt, &x.TopupOrderID, &x.ConfirmedAt, &x.ConfirmMethod, &x.PaidAmountE8, &late, &x.VoidReason, &x.DefaultedAt, &x.SelfDeal, &x.Unreadable, &x.CreatedAt, &x.UpdatedAt, &x.CheckingAt, &x.CheckNote, &x.CheckRejects, &x.CheckAuto, &x.AmountE8, &x.Views, &x.ViewsAt, &x.SettleViews, &x.DefaultWarnedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -268,6 +268,22 @@ func (s *Store) SetTweetCanonical(id int64, tweetID, root string) error {
 // TweetUsedElsewhere 这条推文（任一编辑版本）是否已被别的记录使用。
 func (s *Store) TweetUsedElsewhere(tweetID, root string, exceptID int64) bool {
 	return s.count(`SELECT COUNT(*) FROM submissions WHERE id<>? AND (tweet_id=? OR tweet_id=? OR (tweet_root<>'' AND tweet_root=?))`, exceptID, tweetID, root, root) > 0
+}
+
+// OverdueToWarn 逾期已达警告线、还没警告过的记录。
+func (s *Store) OverdueToWarn(before int64) ([]*Submission, error) {
+	return s.querySubs(`WHERE (status='overdue' OR (status='disputed' AND prev_status='overdue')) AND default_warned_at=0 AND overdue_at>0 AND overdue_at<=? ORDER BY id`, before)
+}
+
+// OverdueToDefault 逾期已达自动违约线、且警告已发出 24 小时以上的记录。
+func (s *Store) OverdueToDefault(overdueBefore, warnedBefore int64) ([]*Submission, error) {
+	return s.querySubs(`WHERE (status='overdue' OR (status='disputed' AND prev_status='overdue')) AND overdue_at>0 AND overdue_at<=? AND default_warned_at>0 AND default_warned_at<=? ORDER BY id`, overdueBefore, warnedBefore)
+}
+
+func (s *Store) SetDefaultWarned(ids []int64) {
+	for _, id := range ids {
+		s.db.Exec(`UPDATE submissions SET default_warned_at=?, updated_at=? WHERE id=? AND default_warned_at=0`, ms(), ms(), id)
+	}
 }
 
 // SetPaid 完成。late 由是否曾逾期决定（overdue_at>0）。

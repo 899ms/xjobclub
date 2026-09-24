@@ -240,58 +240,59 @@ func terminalSub(s string) bool {
 func slotFree(s string) bool { return s == SExpired || s == SVoid }
 
 type Submission struct {
-	ID             int64
-	Code           string
-	TaskID         int64
-	WorkerID       int64
-	VariantIdx     int64
-	Status         string
-	PrevStatus     string // 进入 disputed 前的状态
-	ClaimedAt      int64
-	ClaimExpiresAt int64
-	TweetID        string
-	TweetURL       string
-	TweetRoot      string // 推文编辑组的原始 ID（同一条推文的各编辑版本共用，防一帖多投）
-	TweetText      string
-	TweetCreatedAt int64
-	VerifyAttempts int64
-	VerifyRetries  int64
-	LastError      string
-	NextVerifyAt   int64
-	VerifiedAt     int64
-	RecheckDueAt   int64
-	RecheckFlag    string
-	RecheckTries   int64
-	PayableAt      int64
-	PayDeadlineAt  int64
-	OverdueAt      int64
-	ReportedAt     int64
-	GraceUntil     int64
-	MarkedPaidAt   int64
-	MarkedOrderID  string
-	MarkedNote     string
-	UnderpaidE8    int64 // 网关少付：实付金额（0 = 无少付）
-	TopupRequested int64 // 接单方要求补差的时间（期间不自动完成）
-	TopupMarkedAt  int64 // 发布方登记补差订单号的时间
-	TopupOrderID   string
-	ConfirmedAt    int64
-	ConfirmMethod  string
-	PaidAmountE8   int64
-	Late           bool
-	VoidReason     string
-	DefaultedAt    int64
-	SelfDeal       int64 // 疑似自导自演（不计信用）
-	Unreadable     int64 // 复检连续读不到次数
-	CheckingAt     int64 // 点赞/转发：提交核对的时间
-	CheckNote      string
-	CheckRejects   int64
-	CheckAuto      int64 // 1 = 发布方超时未核对，视为通过
-	AmountE8       int64 // 按浏览量结算后的应付金额（0 = 用任务单价）
-	Views          int64 // 记录到的最大浏览量，-1 未知
-	ViewsAt        int64
-	SettleViews    int64 // 结算时采用的浏览量，-1 未结算
-	CreatedAt      int64
-	UpdatedAt      int64
+	ID              int64
+	Code            string
+	TaskID          int64
+	WorkerID        int64
+	VariantIdx      int64
+	Status          string
+	PrevStatus      string // 进入 disputed 前的状态
+	ClaimedAt       int64
+	ClaimExpiresAt  int64
+	TweetID         string
+	TweetURL        string
+	TweetRoot       string // 推文编辑组的原始 ID（同一条推文的各编辑版本共用，防一帖多投）
+	DefaultWarnedAt int64  // 逾期自动违约的警告发出时间（0 = 未警告）
+	TweetText       string
+	TweetCreatedAt  int64
+	VerifyAttempts  int64
+	VerifyRetries   int64
+	LastError       string
+	NextVerifyAt    int64
+	VerifiedAt      int64
+	RecheckDueAt    int64
+	RecheckFlag     string
+	RecheckTries    int64
+	PayableAt       int64
+	PayDeadlineAt   int64
+	OverdueAt       int64
+	ReportedAt      int64
+	GraceUntil      int64
+	MarkedPaidAt    int64
+	MarkedOrderID   string
+	MarkedNote      string
+	UnderpaidE8     int64 // 网关少付：实付金额（0 = 无少付）
+	TopupRequested  int64 // 接单方要求补差的时间（期间不自动完成）
+	TopupMarkedAt   int64 // 发布方登记补差订单号的时间
+	TopupOrderID    string
+	ConfirmedAt     int64
+	ConfirmMethod   string
+	PaidAmountE8    int64
+	Late            bool
+	VoidReason      string
+	DefaultedAt     int64
+	SelfDeal        int64 // 疑似自导自演（不计信用）
+	Unreadable      int64 // 复检连续读不到次数
+	CheckingAt      int64 // 点赞/转发：提交核对的时间
+	CheckNote       string
+	CheckRejects    int64
+	CheckAuto       int64 // 1 = 发布方超时未核对，视为通过
+	AmountE8        int64 // 按浏览量结算后的应付金额（0 = 用任务单价）
+	Views           int64 // 记录到的最大浏览量，-1 未知
+	ViewsAt         int64
+	SettleViews     int64 // 结算时采用的浏览量，-1 未结算
+	CreatedAt       int64
+	UpdatedAt       int64
 
 	Task   *Task
 	Worker *User
@@ -492,7 +493,7 @@ func joinLower(xs []string) string { return strings.ToLower(strings.Join(xs, "\n
 var auditTextMap = map[string]string{
 	"sub.claim": "", "sub.submit": "提交链接，开始验证", "sub.verified": "验证通过", "sub.force_verified": "管理员判定验证通过", "sub.payable": "留存复检通过，进入待付款",
 	"sub.expired": "超时未提交，名额释放", "sub.void": "作废", "sub.overdue": "付款逾期", "sub.mark_paid": "发布方登记已付", "sub.paid": "付款完成", "sub.repaid": "补付到账",
-	"sub.underpaid": "少付处理", "sub.topup_requested": "接单方要求补差", "sub.defaulted": "记为违约", "sub.checking": "提交核对", "sub.paynow": "发布方选择提前付款，不等留存到期", "sub.auto_confirm": "待确认到账超时未处理，视为已收到自动完成", "sub.selfdeal": "管理员调整自导自演标记", "sub.check_ok": "发布方确认已完成",
+	"sub.underpaid": "少付处理", "sub.topup_requested": "接单方要求补差", "sub.defaulted": "记为违约", "sub.checking": "提交核对", "sub.paynow": "发布方选择提前付款，不等留存到期", "sub.auto_confirm": "待确认到账超时未处理，视为已收到自动完成", "sub.selfdeal": "管理员调整自导自演标记", "sub.default_warn": "逾期即将自动记为违约，已警告发布方", "blacklist.auto": "逾期超时未付，自动列入黑名单", "sub.check_ok": "发布方确认已完成",
 	"sub.check_no": "发布方未见到，退回重做", "sub.check_void": "两次核对未见到，作废", "sub.check_auto": "发布方超时未核对，视为通过", "sub.repost_detected": "自动检测到转发",
 	"dispute.open": "发起申诉", "dispute.resolve": "申诉裁决", "dispute.auto_close": "申诉自动结案", "task.takedown": "任务被下架",
 	"pay.payer_mismatch": "付款账户与认证不一致", "pay.unexpected": "收到未预期的付款",

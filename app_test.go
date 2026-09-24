@@ -2681,3 +2681,210 @@ func TestAdminStatsPage(t *testing.T) {
 		t.Fatalf("stats page: %d %s", resp.StatusCode, snippet(body))
 	}
 }
+
+// ---- 逾期超时自动违约上榜（不等举报） ----
+
+func TestOverdueAutoDefault(t *testing.T) {
+	e := newEnv(t, "OPEN_TASKS_NEWBIE=10\nOVERDUE_AUTO_DEFAULT_H=72\n")
+	alice, bob, carl, dan := e.browser("alice"), e.browser("bob"), e.browser("carl"), e.browser("dan")
+	au := alice.register("alice", "9101")
+	bu := bob.register("bob", "9102")
+	carl.register("carl", "9103")
+	du := dan.register("dan", "9104")
+	alice.setUID("48001")
+	alice.certify("payer-OD")
+	bob.setUID("48002")
+	carl.setUID("48003")
+	dan.setUID("48004")
+	task := alice.publish(taskForm(url.Values{"slots": {"3"}}))
+	payable := func(b *browser, xid, tid string) *Submission {
+		t.Helper()
+		x := b.claim(task)
+		e.synd.add(mockTweet{ID: tid, Text: task.Contents[0], UserID: xid, Handle: b.who})
+		x = b.submitTweet(x, tid)
+		if x.Status != SPayable {
+			t.Fatalf("payable expected: %s", x.Status)
+		}
+		return x
+	}
+	overdue := func(x *Submission) *Submission {
+		t.Helper()
+		e.a.st.db.Exec(`UPDATE submissions SET pay_deadline_at=? WHERE id=?`, ms()-1, x.ID)
+		e.a.runJobs()
+		x, _ = e.a.st.GetSubByID(x.ID)
+		if x.Status != SOverdue {
+			t.Fatalf("overdue expected: %s", x.Status)
+		}
+		return x
+	}
+	// 三个人先都接单并进入待付款（逾期后发布方冻结、任务暂停，之后就接不了了）
+	p1, p2, p3 := payable(bob, "9102", "9201"), payable(carl, "9103", "9202"), payable(dan, "9104", "9203")
+	x1 := overdue(p1)
+	if n := e.a.st.count(`SELECT COUNT(*) FROM notifications WHERE user_id=? AND body LIKE '%自动记为违约%'`, au.ID); n != 1 {
+		t.Fatalf("overdue notice should mention auto default, got %d", n)
+	}
+	// 刚逾期：既不警告也不违约
+	e.a.runJobs()
+	if nx, _ := e.a.st.GetSubByID(x1.ID); nx.Status != SOverdue || nx.DefaultWarnedAt != 0 {
+		t.Fatalf("fresh overdue must be left alone: %s warned=%d", nx.Status, nx.DefaultWarnedAt)
+	}
+	// 逾期 49 小时：发出最后警告（阈值 72h 前 24h），仍是逾期
+	e.a.st.db.Exec(`UPDATE submissions SET overdue_at=? WHERE id=?`, ms()-49*hourMs, x1.ID)
+	e.a.runJobs()
+	x1, _ = e.a.st.GetSubByID(x1.ID)
+	if x1.Status != SOverdue || x1.DefaultWarnedAt == 0 {
+		t.Fatalf("should be warned but still overdue: %s warned=%d", x1.Status, x1.DefaultWarnedAt)
+	}
+	if n := e.a.st.count(`SELECT COUNT(*) FROM notifications WHERE user_id=? AND title LIKE '最后提醒%'`, au.ID); n != 1 {
+		t.Fatalf("one final warning expected, got %d", n)
+	}
+	e.a.runJobs()
+	if n := e.a.st.count(`SELECT COUNT(*) FROM notifications WHERE user_id=? AND title LIKE '最后提醒%'`, au.ID); n != 1 {
+		t.Fatal("warning must not repeat")
+	}
+	// 逾期满 73 小时但警告不足 24 小时：还不动手
+	e.a.st.db.Exec(`UPDATE submissions SET overdue_at=? WHERE id=?`, ms()-73*hourMs, x1.ID)
+	e.a.runJobs()
+	if nx, _ := e.a.st.GetSubByID(x1.ID); nx.Status != SOverdue {
+		t.Fatalf("warning must have 24h to take effect: %s", nx.Status)
+	}
+	// 同一发布方另两条：carl 刚逾期；dan 逾期后举报了（A 类，举证中）
+	x2 := overdue(p2)
+	x3 := overdue(p3)
+	if resp, _ := dan.post("/s/"+x3.Code+"/dispute", url.Values{"type": {"A"}, "text": {"逾期两天了，一直不付"}}); resp.StatusCode != 302 {
+		t.Fatal("report A failed")
+	}
+	d3, _ := e.a.st.OpenDisputeForSub(x3.ID)
+	if d3 == nil || d3.Type != "A" {
+		t.Fatalf("dispute %+v", d3)
+	}
+	// 警告满 24 小时 → 自动违约上榜：名下全部逾期记录转违约、举报成立、任务关闭、接单方与发布方都收到通知
+	e.a.st.db.Exec(`UPDATE submissions SET default_warned_at=? WHERE id=?`, ms()-25*hourMs, x1.ID)
+	e.a.runJobs()
+	for _, x := range []*Submission{x1, x2, x3} {
+		if nx, _ := e.a.st.GetSubByID(x.ID); nx.Status != SDefault {
+			t.Fatalf("%s should be defaulted, got %s", x.Code, nx.Status)
+		}
+	}
+	bl, _ := e.a.st.ActiveBlacklist(au.ID)
+	if bl == nil || bl.Role != "publisher" || bl.AmountOwedE8 != 3*100000000 {
+		t.Fatalf("publisher should be blacklisted with 3 U owed: %+v", bl)
+	}
+	if tk, _ := e.a.st.GetTaskByID(task.ID); tk.Status != "closed" {
+		t.Fatalf("owner tasks must close: %s", tk.Status)
+	}
+	if d, _ := e.a.st.GetDisputeByID(d3.ID); d.Status != "resolved" || d.Resolution != "upheld" {
+		t.Fatalf("pending A report should be upheld automatically: %s %s", d.Status, d.Resolution)
+	}
+	if n := e.a.st.count(`SELECT COUNT(*) FROM audit_log WHERE action='blacklist.auto'`); n != 1 {
+		t.Fatalf("audit blacklist.auto %d", n)
+	}
+	if n := e.a.st.count(`SELECT COUNT(*) FROM notifications WHERE user_id=? AND title LIKE '%已上黑名单%'`, bu.ID); n != 1 {
+		t.Fatal("worker should be told")
+	}
+	if n := e.a.st.count(`SELECT COUNT(*) FROM notifications WHERE user_id=? AND title LIKE '举报%已成立'`, du.ID); n != 1 {
+		t.Fatal("reporter should be told the report was upheld")
+	}
+	// 再跑一次不重复处理；发布方不能再发布
+	e.a.runJobs()
+	if n := e.a.st.count(`SELECT COUNT(*) FROM audit_log WHERE action='blacklist.auto'`); n != 1 {
+		t.Fatal("must not re-blacklist")
+	}
+	if resp, _ := alice.post("/new", taskForm(url.Values{"title": {"再来一个"}})); resp.StatusCode == 302 {
+		t.Fatal("blacklisted publisher must not publish")
+	}
+	for _, pth := range []string{x1.Path(), x3.Path(), "/me", "/blacklist", "/rules"} {
+		if _, body := alice.get(pth); strings.Contains(body, "[0x") || strings.Contains(body, "%!") {
+			t.Fatalf("raw value leaked on %s", pth)
+		}
+	}
+}
+
+func TestOverdueAutoDefaultDisabled(t *testing.T) {
+	e := newEnv(t, "OPEN_TASKS_NEWBIE=10\nOVERDUE_AUTO_DEFAULT_H=0\n")
+	alice, bob := e.browser("alice"), e.browser("bob")
+	au := alice.register("alice", "9301")
+	bob.register("bob", "9302")
+	alice.setUID("48101")
+	alice.certify("payer-OD2")
+	bob.setUID("48102")
+	task := alice.publish(taskForm(url.Values{"slots": {"1"}}))
+	x := bob.claim(task)
+	e.synd.add(mockTweet{ID: "9401", Text: task.Contents[0], UserID: "9302", Handle: "bob"})
+	x = bob.submitTweet(x, "9401")
+	e.a.st.db.Exec(`UPDATE submissions SET pay_deadline_at=? WHERE id=?`, ms()-1, x.ID)
+	e.a.runJobs()
+	e.a.st.db.Exec(`UPDATE submissions SET overdue_at=?, default_warned_at=? WHERE id=?`, ms()-30*dayMs, ms()-29*dayMs, x.ID)
+	e.a.runJobs()
+	if nx, _ := e.a.st.GetSubByID(x.ID); nx.Status != SOverdue {
+		t.Fatalf("disabled: must stay overdue, got %s", nx.Status)
+	}
+	if bl, _ := e.a.st.ActiveBlacklist(au.ID); bl != nil {
+		t.Fatal("disabled: no blacklist")
+	}
+}
+
+// ---- 自动违约：只有被举报的记录也在范围内；接单方在逾期态可直接确认 ----
+
+func TestOverdueAutoDefaultReportedAndConfirm(t *testing.T) {
+	e := newEnv(t, "OPEN_TASKS_NEWBIE=10\nOVERDUE_AUTO_DEFAULT_H=72\n")
+	alice, bob, carl := e.browser("alice"), e.browser("bob"), e.browser("carl")
+	au := alice.register("alice", "9501")
+	bob.register("bob", "9502")
+	carl.register("carl", "9503")
+	alice.setUID("48201")
+	alice.certify("payer-OD3")
+	bob.setUID("48202")
+	carl.setUID("48203")
+	task := alice.publish(taskForm(url.Values{"slots": {"2"}}))
+	mk := func(b *browser, xid, tid string) *Submission {
+		t.Helper()
+		x := b.claim(task)
+		e.synd.add(mockTweet{ID: tid, Text: task.Contents[0], UserID: xid, Handle: b.who})
+		return b.submitTweet(x, tid)
+	}
+	x1, x2 := mk(bob, "9502", "9601"), mk(carl, "9503", "9602")
+	e.a.st.db.Exec(`UPDATE submissions SET pay_deadline_at=? WHERE id IN (?,?)`, ms()-1, x1.ID, x2.ID)
+	e.a.runJobs()
+	// carl：发布方其实付了但没登记 → 接单方在逾期态直接确认完成
+	if _, body := carl.get(x2.Path()); !strings.Contains(body, "钱已经到账了") {
+		t.Fatal("worker should see the direct-confirm fold on an overdue record")
+	}
+	if resp, _ := carl.post("/s/"+x2.Code+"/confirm", nil); resp.StatusCode != 302 {
+		t.Fatal("confirm on overdue should work")
+	}
+	if nx, _ := e.a.st.GetSubByID(x2.ID); nx.Status != SPaid || nx.ConfirmMethod != "manual" {
+		t.Fatalf("paid expected: %s %s", nx.Status, nx.ConfirmMethod)
+	}
+	// bob：举报了（记录变成 disputed），发布方名下再无别的逾期记录 → 自动违约仍要覆盖它
+	if resp, _ := bob.post("/s/"+x1.Code+"/dispute", url.Values{"type": {"A"}, "text": {"逾期了一直不付款"}}); resp.StatusCode != 302 {
+		t.Fatal("report failed")
+	}
+	d, _ := e.a.st.OpenDisputeForSub(x1.ID)
+	if d == nil {
+		t.Fatal("dispute expected")
+	}
+	e.a.st.db.Exec(`UPDATE submissions SET overdue_at=? WHERE id=?`, ms()-49*hourMs, x1.ID)
+	e.a.runJobs()
+	if nx, _ := e.a.st.GetSubByID(x1.ID); nx.DefaultWarnedAt == 0 || nx.Status != SDisputed {
+		t.Fatalf("reported record must still get the warning: %s warned=%d", nx.Status, nx.DefaultWarnedAt)
+	}
+	e.a.st.db.Exec(`UPDATE submissions SET overdue_at=?, default_warned_at=? WHERE id=?`, ms()-73*hourMs, ms()-25*hourMs, x1.ID)
+	e.a.runJobs()
+	if nx, _ := e.a.st.GetSubByID(x1.ID); nx.Status != SDefault {
+		t.Fatalf("reported-only record must auto-default too: %s", nx.Status)
+	}
+	if bl, _ := e.a.st.ActiveBlacklist(au.ID); bl == nil || bl.AmountOwedE8 != 100000000 {
+		t.Fatalf("blacklist with 1 U owed expected: %+v", bl)
+	}
+	if d2, _ := e.a.st.GetDisputeByID(d.ID); d2.Status != "resolved" || d2.Resolution != "upheld" {
+		t.Fatalf("report should be upheld: %s %s", d2.Status, d2.Resolution)
+	}
+	if _, body := bob.get(d.Path()); !strings.Contains(body, "· 系统") || strings.Contains(body, "· 小法庭") {
+		t.Fatal("auto-resolved report must be labelled 系统, not 小法庭")
+	}
+	// 已在榜：后续不再发「最后提醒」
+	if n := e.a.st.count(`SELECT COUNT(*) FROM notifications WHERE user_id=? AND title LIKE '最后提醒%'`, au.ID); n != 1 {
+		t.Fatalf("exactly one final warning expected, got %d", n)
+	}
+}

@@ -117,6 +117,7 @@ var schema = []string{
 		tweet_id TEXT NOT NULL DEFAULT '',
 		tweet_url TEXT NOT NULL DEFAULT '',
 		tweet_root TEXT NOT NULL DEFAULT '',
+		default_warned_at INTEGER NOT NULL DEFAULT 0,
 		tweet_text TEXT NOT NULL DEFAULT '',
 		tweet_created_at INTEGER NOT NULL DEFAULT 0,
 		verify_attempts INTEGER NOT NULL DEFAULT 0,
@@ -321,6 +322,7 @@ var migrations = []string{
 	`ALTER TABLE submissions ADD COLUMN views_at INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE submissions ADD COLUMN settle_views INTEGER NOT NULL DEFAULT -1`,
 	`ALTER TABLE submissions ADD COLUMN tweet_root TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE submissions ADD COLUMN default_warned_at INTEGER NOT NULL DEFAULT 0`,
 	`CREATE INDEX IF NOT EXISTS idx_sub_root ON submissions(tweet_root) WHERE tweet_root<>''`,
 }
 

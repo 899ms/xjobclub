@@ -44,6 +44,7 @@ func (a *App) runJobs() {
 	a.retryVerifies(now)
 	a.runRechecks(now)
 	a.overduePayables(now)
+	a.autoDefaultOverdue(now)
 	a.autoApproveCheckings(now)
 	a.autoConfirmAwaiting(now)
 	a.closeTasks()
@@ -128,8 +129,85 @@ func (a *App) overduePayables(now int64) {
 			continue
 		}
 		n := a.st.FreezeOwnerTasks(t.OwnerID)
-		a.notify(t.OwnerID, "pay", "记录 "+x.Code+" 已逾期未付", fmt.Sprintf("你的账号已冻结（%d 个任务暂停接单），付清后自动恢复。接单方可以举报，核实后将进入黑名单。", n), x.Path())
-		a.notify(x.WorkerID, "pay", "发布方逾期未付款", "记录 "+x.Code+" 已逾期，你可以在记录页举报；对方付清会自动通知你。", x.Path())
+		auto := ""
+		if a.cfg.OverdueAutoDefaultH > 0 {
+			auto = fmt.Sprintf("逾期满 %s 仍未付清（或未登记已付），系统会自动记为违约并将你列入黑名单，不需要对方举报。", dur(a.cfg.OverdueAutoDefaultH))
+		}
+		a.notify(t.OwnerID, "pay", "记录 "+x.Code+" 已逾期未付", fmt.Sprintf("你的账号已冻结（%d 个任务暂停接单），付清后自动恢复。接单方可以举报，核实后将进入黑名单。%s", n, auto), x.Path())
+		wauto := ""
+		if a.cfg.OverdueAutoDefaultH > 0 {
+			wauto = fmt.Sprintf("逾期满 %s 系统会自动记为违约并将对方列入黑名单，不举报也会处理；举报可以加快核实。", dur(a.cfg.OverdueAutoDefaultH))
+		}
+		a.notify(x.WorkerID, "pay", "发布方逾期未付款", "记录 "+x.Code+" 已逾期，你可以在记录页举报；对方付清会自动通知你。"+wauto, x.Path())
+	}
+}
+
+// autoDefaultOverdue 逾期满 OverdueAutoDefaultH 仍未付：不等接单方举报，自动记为违约并把发布方列入黑名单。
+// 两步走：先在到点前 24 小时（至少）警告发布方一次（登记已付 / 付清都能解除），警告满 24 小时且逾期满阈值才动手。
+// 上黑名单的效果与 A 类举报成立完全一致（名下逾期记录全部转违约、欠款公示、任务关闭）；误伤可走 F 类申诉。
+func (a *App) autoDefaultOverdue(now int64) {
+	h := a.cfg.OverdueAutoDefaultH
+	if h <= 0 {
+		return
+	}
+	// 1) 警告：逾期时长达到 (阈值 - 24h) 的记录，按发布方合并成一条通知
+	warnLine := now - max(h-24, 0)*hourMs
+	if subs, _ := a.st.OverdueToWarn(warnLine); len(subs) > 0 {
+		byOwner := map[int64][]*Submission{}
+		for _, x := range subs {
+			if t, _ := a.st.GetTaskByID(x.TaskID); t != nil {
+				byOwner[t.OwnerID] = append(byOwner[t.OwnerID], x)
+			}
+		}
+		for owner := range byOwner {
+			// 一个发布方只警告一次：把名下所有逾期（含举报中）记录一起标记、合计欠款
+			all, _ := a.st.SubsByOwnerStatus(owner, SOverdue, SDisputed)
+			var ids []int64
+			var sum int64
+			for _, x := range all {
+				if x.Status == SDisputed && x.PrevStatus != SOverdue {
+					continue
+				}
+				ids = append(ids, x.ID)
+				if t, _ := a.st.GetTaskByID(x.TaskID); t != nil {
+					sum += max(payAmount(x, t)-x.UnderpaidE8, 0)
+				}
+				if x.DefaultWarnedAt == 0 {
+					a.st.Audit(0, "sub.default_warn", "submission", x.ID, map[string]any{"owed": fmtE8(sum)}, "")
+				}
+			}
+			a.st.SetDefaultWarned(ids)
+			if bl, _ := a.st.ActiveBlacklist(owner); bl != nil {
+				continue // 已在榜的不用再吓唬
+			}
+			a.notify(owner, "pay", fmt.Sprintf("最后提醒：%d 笔逾期未付将自动记为违约", len(ids)), fmt.Sprintf("共 %s U。24 小时内付清（自动到账）或在记录页登记已付，否则系统会自动记为违约并将你列入黑名单，名下任务全部关闭。", fmtE8(sum)), "/me")
+		}
+	}
+	// 2) 违约上榜：逾期满阈值，且警告已满 24 小时
+	subs, _ := a.st.OverdueToDefault(now-h*hourMs, now-dayMs)
+	done := map[int64]bool{}
+	for _, x := range subs {
+		t, _ := a.st.GetTaskByID(x.TaskID)
+		if t == nil || done[t.OwnerID] {
+			continue
+		}
+		done[t.OwnerID] = true
+		owner, _ := a.st.GetUserByID(t.OwnerID)
+		if owner == nil {
+			continue
+		}
+		a.st.Audit(0, "blacklist.auto", "user", owner.ID, map[string]any{"record": x.Code, "overdue_h": (now - x.OverdueAt) / hourMs}, "")
+		a.blacklistUser(owner, "publisher", fmt.Sprintf("逾期 %s 仍未付款，自动记为违约", dur(h)), 0, "")
+		// 该发布方名下正在举报流程里、还没交小法庭的 A 类申诉：结论已定，直接成立结案
+		if ds, _ := a.st.queryDisputes(`WHERE type='A' AND status<>'resolved' AND jury_case_id=0 AND submission_id IN (SELECT id FROM submissions WHERE status='defaulted' AND task_id IN (SELECT id FROM tasks WHERE owner_id=?))`, owner.ID); len(ds) > 0 {
+			for _, d := range ds {
+				if !a.st.ResolveDisputeIfOpen(d.ID, "upheld", "发布方逾期超时，系统已自动记为违约并列入黑名单，举报成立") {
+					continue
+				}
+				a.st.Audit(0, "dispute.auto_close", "dispute", d.ID, map[string]any{"by": "auto_default"}, "")
+				a.notify(d.OpenerID, "dispute", "举报 "+d.Code+" 已成立", "发布方逾期超时，系统已自动将其列入黑名单，记录转为违约；对方补付后会通知你。", d.Path())
+			}
+		}
 	}
 }
 

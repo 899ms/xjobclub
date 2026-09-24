@@ -118,6 +118,16 @@ func (s *Store) ResolveDispute(id int64, resolution, note string, by int64) erro
 	return err
 }
 
+// ResolveDisputeIfOpen 只对未结的申诉写结论（系统自动结案用，避免覆盖刚做出的人工裁决）。
+func (s *Store) ResolveDisputeIfOpen(id int64, resolution, note string) bool {
+	res, err := s.db.Exec(`UPDATE disputes SET status='resolved', resolution=?, resolution_note=?, resolved_by=0, resolved_at=?, updated_at=? WHERE id=? AND status<>'resolved'`, resolution, note, ms(), ms(), id)
+	if err != nil {
+		return false
+	}
+	n, _ := res.RowsAffected()
+	return n == 1
+}
+
 // EvidenceExpired 举证期已过、尚未进入审理的申诉。
 func (s *Store) EvidenceExpired(now int64) ([]*Dispute, error) {
 	return s.queryDisputes(`WHERE status='evidence' AND evidence_until<=? ORDER BY id LIMIT 100`, now)
